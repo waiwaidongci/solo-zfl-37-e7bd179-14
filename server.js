@@ -262,6 +262,13 @@ function requireActor(db, input) {
   if (!user) throw httpError(400, "unknown_actor", "操作人不存在或未选择");
   return user;
 }
+function requireManager(db, input, action) {
+  const user = requireActor(db, input);
+  if (!user.roles.some(r => ["admin", "reviewer"].includes(r))) {
+    throw httpError(403, "forbidden", "只有管理员或审核角色可以" + action + "，试验员无权操作");
+  }
+  return user;
+}
 function httpError(status, error, message) { return Object.assign(new Error(message || error), { status, error }); }
 
 function computeStats(items) {
@@ -344,15 +351,18 @@ async function route(req, res, url) {
     return send(res, 200, list);
   }
 
-  /* ---- 墨锭建档 ---- */
+  /* ---- 墨锭建档：任何角色都只能建为「待试磨」，终态只能经接单/试磨产生 ---- */
   if (req.method === "POST" && p === "/api/items") {
     const input = await body(req);
     requireActor(db, input);
+    if (input.status && input.status !== "待试磨") {
+      throw httpError(400, "terminal_status_forbidden", "建档只能是「待试磨」，接单与试磨终态必须由本人持有效资质操作产生");
+    }
     const item = {
       id: newId("IS"), code: input.code, scope: input.scope || SCOPES[0],
       smokeSource: input.smokeSource, glueRatio: input.glueRatio,
       ageYears: input.ageYears, storage: input.storage,
-      status: input.status || "待试磨",
+      status: "待试磨",
       logs: [{ at: nowIso(), step: "建档", note: "创建墨锭" }]
     };
     db.items.unshift(item);
@@ -364,14 +374,19 @@ async function route(req, res, url) {
   if (patch && req.method === "PATCH") {
     const input = await body(req);
     const actor = requireActor(db, input);
-    if (!actor.roles.some(r => ["admin", "reviewer"].includes(r))) throw httpError(403, "forbidden", "只有管理员可直接调整墨锭状态");
+    if (!actor.roles.some(r => ["admin", "reviewer"].includes(r))) throw httpError(403, "forbidden", "只有管理员可调整墨锭信息");
     const item = findItem(db, patch[1]);
     if (!item) return send(res, 404, { error: "item_not_found" });
-    const next = input.status || item.status;
-    Object.assign(item, input);
+    if (input.status && input.status !== item.status) {
+      // 状态机只能由接单/试磨驱动，禁止通过通用更新接口改状态（含已试磨、重点观察等终态）
+      throw httpError(400, "status_change_forbidden", "墨锭状态只能由接单、试磨流程产生，不能直接改写");
+    }
+    for (const key of ["scope", "smokeSource", "glueRatio", "ageYears", "storage", "code"]) {
+      if (input[key] !== undefined) item[key] = input[key];
+    }
     item.logs ||= [];
-    item.logs.push({ at: nowIso(), step: "状态", note: actor.name + " 更新为" + next });
-    audit(db, { at: nowIso(), type: "item_status_patched", actorId: actor.id, actorName: actor.name, itemCode: item.code, detail: `管理员将 ${item.code} 状态调整为 ${next}`, allowed: true });
+    item.logs.push({ at: nowIso(), step: "信息", note: actor.name + " 更新墨锭信息" });
+    audit(db, { at: nowIso(), type: "item_info_patched", actorId: actor.id, actorName: actor.name, itemCode: item.code, detail: `管理员更新 ${item.code} 信息`, allowed: true });
     await persist(db, req, res, 200, item);
     return;
   }
@@ -445,7 +460,7 @@ async function route(req, res, url) {
   const suspendMatch = p.match(/^\/api\/qualifications\/([^/]+)\/suspend$/);
   if (suspendMatch && req.method === "POST") {
     const input = await body(req);
-    const actor = requireActor(db, input);
+    const actor = requireManager(db, input, "暂停资质");
     const q = db.qualifications.find(x => x.id === suspendMatch[1]);
     if (!q) throw httpError(404, "qualification_not_found");
     const from = input.from || todayOf(nowIso());
@@ -461,7 +476,7 @@ async function route(req, res, url) {
   const resumeMatch = p.match(/^\/api\/qualifications\/([^/]+)\/resume$/);
   if (resumeMatch && req.method === "POST") {
     const input = await body(req);
-    const actor = requireActor(db, input);
+    const actor = requireManager(db, input, "复核恢复资质");
     const q = db.qualifications.find(x => x.id === resumeMatch[1]);
     if (!q) throw httpError(404, "qualification_not_found");
     const day = input.day || todayOf(nowIso());
@@ -481,9 +496,10 @@ async function route(req, res, url) {
   const renewMatch = p.match(/^\/api\/qualifications\/([^/]+)\/renew$/);
   if (renewMatch && req.method === "POST") {
     const input = await body(req);
-    const actor = requireActor(db, input);
+    const actor = requireManager(db, input, "续期资质");
     const old = db.qualifications.find(x => x.id === renewMatch[1]);
     if (!old) throw httpError(404, "qualification_not_found");
+    if (!input.validUntil) throw httpError(400, "bad_validity", "请填写新有效期");
     const pending = db.qualifications.find(q => q.testerId === old.testerId && q.status === "pending");
     if (pending) throw httpError(409, "pending_exists", "已有待审核版本，不能重复续期");
     const nextVersion = db.qualifications.filter(q => q.testerId === old.testerId).reduce((m, q) => Math.max(m, q.version), 0) + 1;
@@ -495,7 +511,6 @@ async function route(req, res, url) {
       status: "pending", enteredBy: actor.id, reviewedBy: null,
       enteredAt: nowIso(), reviewedAt: null, supersededAt: null, rejectReason: null, suspensions: []
     };
-    if (!input.validUntil) throw httpError(400, "bad_validity", "请填写新有效期");
     db.qualifications.push(q);
     audit(db, { at: nowIso(), type: "qualification_renewed", actorId: actor.id, actorName: actor.name, testerId: old.testerId, testerName: getUser(db, old.testerId).name, qualificationId: q.id, version: nextVersion, detail: `基于 v${old.version} 提交续期 v${nextVersion}，旧版本保留；审核通过前仍按旧版本判断`, allowed: true });
     await persist(db, req, res, 201, q);
@@ -506,7 +521,7 @@ async function route(req, res, url) {
   const disableMatch = p.match(/^\/api\/users\/([^/]+)\/disable$/);
   if (disableMatch && req.method === "POST") {
     const input = await body(req);
-    const actor = requireActor(db, input);
+    const actor = requireManager(db, input, "停用账号");
     const u = getUser(db, disableMatch[1]);
     if (!u) throw httpError(404, "user_not_found");
     u.disabled = true;
@@ -517,7 +532,7 @@ async function route(req, res, url) {
   const enableMatch = p.match(/^\/api\/users\/([^/]+)\/enable$/);
   if (enableMatch && req.method === "POST") {
     const input = await body(req);
-    const actor = requireActor(db, input);
+    const actor = requireManager(db, input, "启用账号");
     const u = getUser(db, enableMatch[1]);
     if (!u) throw httpError(404, "user_not_found");
     u.disabled = false;
@@ -700,8 +715,7 @@ function page() {
           <form id="createForm"><h2>新增墨锭</h2>
             <label>试磨范围（准入匹配项）</label><select name="scope" id="scopeSelect"></select>
             <div id="fields"></div>
-            <label>初始状态</label><select name="status">${stages.map(s => '<option>' + s + '</option>').join('')}</select>
-            <div style="margin-top:12px"><button>保存墨锭</button></div>
+            <div style="margin-top:12px"><button>保存墨锭（建档为待试磨）</button></div>
           </form>
           <form id="actionForm" style="margin-top:14px"><h2>接单 / 提交试磨</h2>
             <label>选择墨锭</label><select name="id" id="itemSelect"></select>
@@ -869,13 +883,18 @@ function page() {
       });
 
       const qs = await api('/api/qualifications');
+      const actor = users.find(u => u.id === actorId);
+      const isManager = actor && actor.roles.some(r => ['admin', 'reviewer'].includes(r));
+      $('#qForm').style.display = isManager ? '' : 'none';
       $('#qList').innerHTML = qs.map(q => {
         const testerName = q.testerName || '';
         const statusPill = { active: ['ok', '有效'], suspended: ['bad', '暂停'], expired: ['bad', '过期'], pending: ['amber', '待审核'], rejected: ['bad', '驳回'], superseded: ['amber', '已替换'] }[q.currentStatus] || ['', q.currentStatus];
         const training = (q.training || []).map(t => (t.at || '') + ' ' + (t.course || t) + (t.hours ? '（' + t.hours + '学时）' : '')).join('；');
         const suspensions = (q.suspensions || []).map(s => '暂停 ' + s.from + '→' + (s.to || '至今') + (s.reason ? '：' + s.reason : '')).join('<br>');
         let actions = '';
-        if (q.status === 'pending') {
+        if (!isManager) {
+          actions = '<div class="meta">管理动作（审核/暂停/恢复/续期）仅管理员或审核角色可执行</div>';
+        } else if (q.status === 'pending') {
           actions = '<div class="row"><button class="mini" data-review="approve:' + q.id + '">审核通过</button><button class="mini danger" data-review="reject:' + q.id + '">驳回</button></div>';
         } else if (q.currentStatus === 'active' || q.currentStatus === 'suspended' || q.currentStatus === 'expired') {
           actions = '<div class="row">' +

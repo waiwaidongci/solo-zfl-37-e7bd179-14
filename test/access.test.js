@@ -366,6 +366,93 @@ test("主文件损坏：重启从 .bak 恢复最近一次完好状态", async ()
 });
 
 /* ------------------------------------------------------------------ */
+test("建档不能直接写终态：已试磨等只能经接单+试磨产生，统计同步", async () => {
+  // 无资质试验员试图在建档时直接写「已试磨」→ 拒绝
+  let r = await api("/api/items", { method: "POST", body: { actorId: T2, code: "B-1", scope: "油烟墨试磨", status: "已试磨" } });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.error, "terminal_status_forbidden");
+
+  // 其他终态同样拒绝
+  for (const status of ["已接单", "重点观察"]) {
+    r = await api("/api/items", { method: "POST", body: { actorId: ADMIN, code: "B-" + status, scope: "油烟墨试磨", status } });
+    assert.equal(r.status, 400, status + " 不应能在建档时写入");
+  }
+  // 拒绝后没有产生任何墨锭
+  let items = await api("/api/items");
+  assert.equal(items.json.length, 2, "只有种子墨锭");
+
+  // 正常建档恒为待试磨，统计中已试磨不增加
+  r = await api("/api/items", { method: "POST", body: { actorId: ADMIN, code: "B-OK", scope: "油烟墨试磨" } });
+  assert.equal(r.status, 201);
+  assert.equal(r.json.status, "待试磨");
+  const stats = await api("/api/stats");
+  assert.equal(stats.json["已试磨"], 1, "种子里只有 IS-001 已试磨");
+  assert.equal(stats.json["待试磨"], 2);
+
+  // PATCH 不能改工作流状态（管理员也不行）
+  const id = r.json.id || r.json.code;
+  r = await api(`/api/items/${id}`, { method: "PATCH", body: { actorId: ADMIN, status: "已试磨" } });
+  assert.equal(r.status, 400);
+  assert.equal(r.json.error, "status_change_forbidden");
+
+  // 终态的唯一合法路径：有资质的试验员接单 → 提交试磨
+  const q = await enterQualification(T2, ["油烟墨试磨"], day(100));
+  await api(`/api/qualifications/${q.id}/review`, { method: "POST", body: { actorId: REVIEWER, decision: "approve" } });
+  r = await api(`/api/items/B-OK/accept`, { method: "POST", body: { actorId: T2 } });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.status, "已接单");
+  r = await api(`/api/items/B-OK/action`, { method: "POST", body: { actorId: T2, paper: "宣纸", score: 92 } });
+  assert.equal(r.status, 201);
+  assert.equal(r.json.status, "已试磨");
+  items = await api("/api/items");
+  const done = items.json.find(i => i.code === "B-OK");
+  assert.equal(done.status, "已试磨");
+  assert.equal(done.assigneeId, T2);
+});
+
+/* ------------------------------------------------------------------ */
+test("越权管理动作：试验员暂停/恢复/续期/停用启用一律403且无状态变化、无审计残留", async () => {
+  const q = await enterQualification(T2, ["油烟墨试磨"], day(100));
+  await api(`/api/qualifications/${q.id}/review`, { method: "POST", body: { actorId: REVIEWER, decision: "approve" } });
+  const auditBefore = (await api("/api/audit")).json.length;
+
+  const attempts = [
+    ["suspend", `/api/qualifications/${q.id}/suspend`, { reason: "越权" }],
+    ["resume", `/api/qualifications/${q.id}/resume`, {}],
+    ["renew", `/api/qualifications/${q.id}/renew`, { validUntil: day(300) }],
+    ["disable", `/api/users/${T1}/disable`, {}],
+    ["enable", `/api/users/${T1}/enable`, {}]
+  ];
+  for (const [name, path, extra] of attempts) {
+    const r = await api(path, { method: "POST", body: { actorId: T2, ...extra } });
+    assert.equal(r.status, 403, name + " 应被拒绝");
+    assert.equal(r.json.error, "forbidden");
+  }
+
+  // 资质本体未变：无暂停段、无新版本
+  const after = await api(`/api/qualifications?testerId=${T2}`);
+  assert.equal(after.json.length, 1, "越权续期不得生成新版本");
+  assert.deepEqual(after.json[0].suspensions, []);
+  assert.equal(after.json[0].status, "approved");
+  // T1 账号未被停用
+  const t1 = (await api("/api/tester-status")).json.find(t => t.userId === T1);
+  assert.equal(t1.disabled, false);
+  // 没有留下任何越权动作的审计记录
+  const auditAfter = await api("/api/audit");
+  assert.equal(auditAfter.json.length, auditBefore, "越权请求不得写操作记录");
+
+  // 管理员与审核角色仍可正常执行（对照）
+  let r = await api(`/api/qualifications/${q.id}/suspend`, { method: "POST", body: { actorId: ADMIN, reason: "合规" } });
+  assert.equal(r.status, 200);
+  r = await api(`/api/qualifications/${q.id}/resume`, { method: "POST", body: { actorId: REVIEWER } });
+  assert.equal(r.status, 200);
+  r = await api(`/api/users/${T2}/disable`, { method: "POST", body: { actorId: REVIEWER } });
+  assert.equal(r.status, 200);
+  r = await api(`/api/users/${T2}/enable`, { method: "POST", body: { actorId: ADMIN } });
+  assert.equal(r.status, 200);
+});
+
+/* ------------------------------------------------------------------ */
 test("页面含准入台关键要素（到期/停用/失败原因/移动端视口）", async () => {
   const res = await fetch(base + "/");
   const html = await res.text();
